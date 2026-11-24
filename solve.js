@@ -14,12 +14,22 @@
 /* ------------------------------------------------------------------ text */
 
 const ESCAPES = { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' };
-const ESCAPE_RE = /[&<>"']/g;
-const ANY_ESCAPE_RE = /[&<>"']/;
+const ESC_SCAN_RE = /[&<>"']/g;
 
-/** `text` with & < > " and ' escaped. */
+/** `text` with & < > " and ' escaped: plain runs are copied whole between the characters the table names. */
 function escapeHtml(text) {
-  return ANY_ESCAPE_RE.test(text) ? text.replace(ESCAPE_RE, (c) => ESCAPES[c]) : text;
+  ESC_SCAN_RE.lastIndex = 0;
+  const m = ESC_SCAN_RE.exec(text);
+  if (m === null) return text;
+  let out = text.slice(0, m.index) + ESCAPES[m[0]];
+  let run = m.index + 1;
+  for (;;) {
+    const n = ESC_SCAN_RE.exec(text);
+    if (n === null) break;
+    out += text.slice(run, n.index) + ESCAPES[n[0]];
+    run = n.index + 1;
+  }
+  return out + text.slice(run);
 }
 
 const NON_ASCII_RE = /[^\x00-\x7F]/;
@@ -83,12 +93,17 @@ function isWsCode(code) {
   return code === 32 || (code >= 9 && code <= 13);
 }
 
+/** ASCII whitespace (the \s class below 128: tab to CR and space), for the word counter's fast path. */
+const WS_TABLE = new Uint8Array(128);
+for (const c of [9, 10, 11, 12, 13, 32]) WS_TABLE[c] = 1;
+
 /** The number of words in `text`: its runs of characters other than whitespace, counted without allocating them. */
 function countWords(text) {
   let count = 0;
   let inWord = false;
   for (let i = 0; i < text.length; i++) {
-    if (isWsCode(text.charCodeAt(i))) inWord = false;
+    const code = text.charCodeAt(i);
+    if (code < 128 ? WS_TABLE[code] === 1 : isWsCode(code)) inWord = false;
     else if (!inWord) {
       inWord = true;
       count++;
@@ -357,18 +372,18 @@ function endsParagraph(line) {
   return isBlankLine(line) || fenceOpen(line) !== null || headingOf(line) !== null || isHR(line);
 }
 
-/** The characters a backslash escapes. */
-const ESCAPABLE = new Set(['\\', '`', '*', '_', '[', ']', '(', ')', '#', '+', '-', '.', '!', '>']);
+/** The characters a backslash escapes, as a table by code unit (all are ASCII). */
+const ESCAPABLE = new Uint8Array(128);
+for (const ch of ['\\', '`', '*', '_', '[', ']', '(', ')', '#', '+', '-', '.', '!', '>']) ESCAPABLE[ch.charCodeAt(0)] = 1;
 
-/** Code units that need work inline: the Markdown specials and the HTML-escapable characters. */
-const INTEREST = new Uint8Array(128);
-for (const ch of ['\\', '`', '*', '[', '&', '<', '>', '"', "'"]) INTEREST[ch.charCodeAt(0)] = 1;
+/** Whether `code` (a code unit) is one a backslash escapes. */
+const isEscapable = (code) => code < 128 && ESCAPABLE[code] === 1;
 
 /** The first index in [from, hi) where `s` holds `what` outside a backslash escape, or -1. */
 function findUnescaped(s, what, from, hi) {
   const wlen = what.length;
   for (let j = from; j <= hi - wlen; j++) {
-    if (s.charCodeAt(j) === 92 && j + 1 < hi && ESCAPABLE.has(s[j + 1])) {
+    if (s.charCodeAt(j) === 92 && j + 1 < hi && isEscapable(s.charCodeAt(j + 1))) {
       j++;
       continue;
     }
@@ -381,7 +396,7 @@ function findUnescaped(s, what, from, hi) {
 function findSingleStar(s, from, hi) {
   for (let j = from; j < hi; j++) {
     const c = s[j];
-    if (c === '\\' && j + 1 < hi && ESCAPABLE.has(s[j + 1])) {
+    if (c === '\\' && j + 1 < hi && isEscapable(s.charCodeAt(j + 1))) {
       j++;
       continue;
     }
@@ -401,6 +416,9 @@ function hasWs(s) {
   return false;
 }
 
+/** The inline specials, for jumping from one to the next instead of stepping over plain text a character at a time. */
+const INLINE_SCAN_RE = /[\\`*\[[&<>"']/g;
+
 /**
  * `s` in [lo, hi) rendered inline, appended to `out`; `link(target)` is a link's href. Plain runs between special
  * characters are copied whole: none of them holds a character the escaper would change.
@@ -412,11 +430,10 @@ function inlineInto(s, lo, hi, link, out) {
     if (end > run) out.push(s.slice(run, end));
   };
   while (i < hi) {
-    const code = s.charCodeAt(i);
-    if (code >= 128 || INTEREST[code] === 0) {
-      i++;
-      continue;
-    }
+    INLINE_SCAN_RE.lastIndex = i;
+    const hit = INLINE_SCAN_RE.exec(s);
+    if (hit === null || hit.index >= hi) break;
+    i = hit.index;
     const c = s[i];
     if (c === '&' || c === '<' || c === '>' || c === '"' || c === "'") {
       flush(i);
@@ -426,7 +443,7 @@ function inlineInto(s, lo, hi, link, out) {
       continue;
     }
     if (c === '\\') {
-      if (i + 1 < hi && ESCAPABLE.has(s[i + 1])) {
+      if (i + 1 < hi && isEscapable(s.charCodeAt(i + 1))) {
         flush(i);
         const n = s[i + 1];
         out.push(n === '>' ? '&gt;' : n);
@@ -574,16 +591,16 @@ function renderMarkdown(src, link, slugify) {
           if (o !== null) cap = o.text;
         } else cap = bulletText(l);
         if (cap !== null) {
-          items.push([trimLine(cap)]);
+          items.push(trimLine(cap));
           i++;
         } else if (isContinued(l)) {
-          items[items.length - 1].push(trimLine(l));
+          items[items.length - 1] += `\n${trimLine(l)}`;
           i++;
         } else break;
       }
       const tag = isOrd ? 'ol' : 'ul';
       let block = `${isOrd && start !== 1 ? `<ol start="${start}">` : `<${tag}>`}\n`;
-      for (const parts of items) block += `<li>${renderInline(parts.join('\n'), link)}</li>\n`;
+      for (const text of items) block += `<li>${renderInline(text, link)}</li>\n`;
       blocks.push(`${block}</${tag}>`);
       continue;
     }
@@ -739,6 +756,16 @@ function includeRender(out, scope, ctx, depth, name) {
   if (t !== undefined && depth < INCLUDE_DEPTH) t(out, scope, ctx, depth + 1);
 }
 
+/** A {{ }} variable, resolved, as text and escaped, pushed to `out` in one call (the compiled templates' var step). */
+function pushVar(out, scope, path) {
+  out.push(escapeHtml(textOf(resolveScope(scope, path))));
+}
+
+/** A {{{ }}} variable, resolved and as text, pushed to `out` in one call. */
+function pushRaw(out, scope, path) {
+  out.push(textOf(resolveScope(scope, path)));
+}
+
 /** The node walker: renders `nodes` into `out`. The compiler's fallback, and its semantic reference. */
 function walkNodes(nodes, scope, ctx, depth, out) {
   for (const n of nodes) {
@@ -775,10 +802,12 @@ function walkNodes(nodes, scope, ctx, depth, out) {
 
 /**
  * A template's nodes compiled to a render function (out, scope, ctx, depth): the tree is turned into straight-line
- * JavaScript once per case, so rendering pays no per-node dispatch. If the generated code cannot be built, the node
- * walker renders the same tree instead.
+ * JavaScript once per case, so rendering pays no per-node dispatch. An include names its target's slot in the
+ * case's function table (`fns`), filled by the caller once every template is compiled, so rendering pays no name
+ * lookup either; a name with no slot renders nothing, exactly as a missing template does. If the generated code
+ * cannot be built, the node walker renders the same tree instead.
  */
-function compileTemplate(nodes) {
+function compileTemplate(nodes, includeSlot, fns) {
   let uid = 0;
   // Each distinct path is materialised once, in the factory's constants, not as a fresh array at every lookup.
   const pathConsts = new Map();
@@ -799,10 +828,10 @@ function compileTemplate(nodes) {
           code += `o.push(${JSON.stringify(n.text)});\n`;
           break;
         case 'var':
-          code += `o.push(E(T(R(${sc},${pathRef(n.path)}))));\n`;
+          code += `PV(o,${sc},${pathRef(n.path)});\n`;
           break;
         case 'raw':
-          code += `o.push(T(R(${sc},${pathRef(n.path)})));\n`;
+          code += `PR(o,${sc},${pathRef(n.path)});\n`;
           break;
         case 'if':
           code += `if (TR(R(${sc},${pathRef(n.path)})) !== ${n.not}) {\n${gen(n.then, sc)}}`;
@@ -815,16 +844,28 @@ function compileTemplate(nodes) {
           const ln = `ln${id}`;
           const k = `k${id}`;
           const sc2 = `sc${id}`;
+          const lp = `lp${id}`;
+          const vs = `vs${id}`;
+          // One scope and one loop record per loop, their fields rewritten per pass: nothing in the dialect can
+          // hold on to either across a pass (there is no assignment and no comparison), so each read within a
+          // pass sees exactly what a fresh pair would hold.
           code +=
             `{ const ${xs} = R(${sc},${pathRef(n.path)}); if (Array.isArray(${xs})) { const ${ln} = ${xs}.length; ` +
-            `for (let ${k} = 0; ${k} < ${ln}; ${k}++) { const ${sc2} = { vars: { [${JSON.stringify(n.name)}]: ${xs}[${k}], ` +
-            `loop: { index: ${k} + 1, first: ${k} === 0, last: ${k} === ${ln} - 1, length: ${ln} } }, parent: ${sc} };\n` +
+            `const ${lp} = { index: 0, first: false, last: false, length: ${ln} }; ` +
+            `const ${vs} = { [${JSON.stringify(n.name)}]: undefined, loop: ${lp} }; ` +
+            `const ${sc2} = { vars: ${vs}, parent: ${sc} }; ` +
+            // A variable itself named "loop" loses to the loop record in the scope literal, as in the walker,
+            // so it is never assigned per pass.
+            `for (let ${k} = 0; ${k} < ${ln}; ${k}++) { ${n.name === 'loop' ? '' : `${vs}[${JSON.stringify(n.name)}] = ${xs}[${k}]; `}` +
+            `${lp}.index = ${k} + 1; ${lp}.first = ${k} === 0; ${lp}.last = ${k} === ${ln} - 1;\n` +
             `${gen(n.body, sc2)}} } }\n`;
           break;
         }
-        case 'include':
-          code += `INC(o,${sc},ctx,depth,${JSON.stringify(n.name)});\n`;
+        case 'include': {
+          const slot = includeSlot(n.name);
+          if (slot >= 0) code += `if (depth < ${INCLUDE_DEPTH}) F[${slot}](o,${sc},ctx,depth + 1);\n`;
           break;
+        }
       }
     }
     return code;
@@ -832,8 +873,8 @@ function compileTemplate(nodes) {
   try {
     const body = gen(nodes, 'sc');
     const consts = [...pathConsts.keys()].map((key, i) => `const P${i} = ${key};`).join('\n');
-    const factory = new Function('R', 'T', 'E', 'TR', 'INC', `${consts}\nreturn function (o, sc, ctx, depth) {\n${body}};`);
-    return factory(resolveScope, textOf, escapeHtml, truthy, includeRender);
+    const factory = new Function('R', 'TR', 'PV', 'PR', 'F', `${consts}\nreturn function (o, sc, ctx, depth) {\n${body}};`);
+    return factory(resolveScope, truthy, pushVar, pushRaw, fns);
   } catch {
     return (o, sc, ctx, depth) => walkNodes(nodes, sc, ctx, depth, o);
   }
@@ -879,17 +920,26 @@ function hasScheme(target) {
 
 /** One site's output tree: path -> text, exactly makefun-site 1.0.0's answer for `input`. */
 export function run(input) {
-  // Templates, parsed in code-unit order of name; one that does not parse is reported and left out.
+  // Templates, parsed in code-unit order of name; one that does not parse is reported and left out. All are
+  // parsed before any is compiled, so an include can bind its target's slot in the shared function table.
   const tpl = new Map();
   const report = [];
+  const parsed = [];
   for (const name of Object.keys(input.templates).sort(byCodeUnits)) {
     try {
-      tpl.set(name, compileTemplate(parseTemplate(name, input.templates[name])));
+      parsed.push([name, parseTemplate(name, input.templates[name])]);
     } catch (err) {
       if (!(err instanceof TemplateError)) throw err;
       report.push(err.message);
     }
   }
+  const slotOf = new Map(parsed.map(([name], i) => [name, i]));
+  const fns = new Array(parsed.length);
+  parsed.forEach(([name, nodes], i) => {
+    const fn = compileTemplate(nodes, (inc) => slotOf.get(inc) ?? -1, fns);
+    fns[i] = fn;
+    tpl.set(name, fn);
+  });
   const ctx = { tpl };
   const base = input.site.base_url.replace(/\/+$/, '');
 
@@ -966,17 +1016,28 @@ export function run(input) {
   // Markdown: each body's rendering, its links resolved to the pages and static files they name.
   const broken = new Set();
   const staticPaths = new Set(statics.map((f) => f.path));
+  // A target's fate depends only on its directory and the case's fixed page and static sets, and targets
+  // repeat across a case's sources, so each (directory, target) pair is resolved once; a broken pair is
+  // cached as null and still reported for every source that names it.
+  const linkCache = new Map();
   for (const s of kept) {
     const dir = dirOf(s.path);
     const dirParts = dir === '' ? [] : dir.split('/');
     const link = (target) => {
       if (hasScheme(target) || target.startsWith('/') || target.startsWith('#')) return target;
-      const hash = target.indexOf('#');
-      const rel = hash === -1 ? target : target.slice(0, hash);
-      const frag = hash === -1 ? '' : target.slice(hash);
-      const path = rel === '' ? null : resolveLinkPath(dirParts, rel);
-      if (path !== null && bySource.has(path)) return `${bySource.get(path).url}${frag}`;
-      if (path !== null && staticPaths.has(path)) return `${base}/${path}${frag}`;
+      const key = `${dir.length}:${dir}${target}`;
+      let href = linkCache.get(key);
+      if (href === undefined) {
+        const hash = target.indexOf('#');
+        const rel = hash === -1 ? target : target.slice(0, hash);
+        const frag = hash === -1 ? '' : target.slice(hash);
+        const path = rel === '' ? null : resolveLinkPath(dirParts, rel);
+        if (path !== null && bySource.has(path)) href = `${bySource.get(path).url}${frag}`;
+        else if (path !== null && staticPaths.has(path)) href = `${base}/${path}${frag}`;
+        else href = null;
+        linkCache.set(key, href);
+      }
+      if (href !== null) return href;
       broken.add(`broken-link ${s.path} -> ${target}`);
       return target;
     };
@@ -1051,7 +1112,7 @@ export function run(input) {
     ...(cards.get(s) ?? cardOf(s)),
     slug: s.slug,
     content: s.html,
-    toc: s.toc.map((h) => ({ level: h.level, id: h.id, html: h.html })),
+    toc: s.toc,
     newer: linkOf(s.newer ?? null),
     older: linkOf(s.older ?? null),
     is_post: s.post,
